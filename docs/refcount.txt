@@ -1,0 +1,561 @@
+Guest Blog by Rodrigo Branco: PAX_REFCOUNT Documentation
+Postby spender » Sat Mar 21, 2015 8:20 am
+Link:  https://forums.grsecurity.net/viewtopic.php?f=7&t=4173&sid=495d1f6431c624438562bf64eb3475db
+
+PaX Reference Counter Protection Documentation
+by Rodrigo Rubira Branco (BSDaemon)
+
+[-- Outline
+
+ABSTRACT
+ABOUT PaX
+MOTIVATION
+OVERVIEW / HOW IT WORKS
+INTERNALS
+Implementation
+Architecture Specifics
+ARM
+Detection logic
+Functions
+Exception handler
+SPARC
+Detection logic
+Functions
+Exception handler
+x86
+Detection logic
+Functions
+Exception handler
+PowerPC
+Detection logic
+Functions
+Exception handler
+MIPS
+Detection logic
+Functions
+Exception handler
+APPENDIX A - Special case on x86
+APPENDIX B - Assumptions
+APPENDIX C - LL/SC mechanism
+ACKNOWLEDGEMENTS / CREDITS
+REFERENCES
+
+[-- Abstract
+
+This document defines the inner workings of PaX's reference counter protection and aims to create a bigger community around the project.
+
+It begins with an overview of the PaX Project and reference counter protection, goes into a higher-level explanation of how it is implemented, and then goes deep inside the implementation's code, enabling readers to more easily port the feature to new platforms.
+
+Special focus is placed on the reasoning for the PowerPC implementation, developed by the author while learning the internals of this protection mechanism.
+
+
+[-- About PaX[1]
+
+PaX is a Linux Kernel Patch project to provide stronger security and limit exploitation primitives in a system. For some bug classes (for example, user-mode pointer dereference), PaX is able to fully prevent exploitation of the entire bug class. It was initially created in 2000.
+
+PaX can be considered a host intrusion prevention system (HIPS) and focuses on the prevention of memory corruption bugs. 
+
+Some of the main PaX features include:
+* Runtime code generation control (non-executable pages)
+* Address Space Layout Randomization (ASLR)
+* Kernel self-protection
+* Various infrastructure changes for supporting all of the above
+
+[-- Motivation
+
+Reference counters (refcount for short) are a way for the operating systems to control access to allocated objects [2]. 
+
+When there is a path inside the kernel where a refcount is incremented more than it is decremented [3], we have what is called a reference counter overflow bug. The reference counter overflow can be exploited by repeatedly forcing the leaky path to execute until the counter reaches INT_MAX. Once this point is reached, the next increment will wrap to INT_MIN, then gradually approaches zero with each subsequent increment. Normally when a reference counter reaches zero, it is a sign that the object containing the reference counter no longer has any users. When an object no longer has any users, it can be safely freed. In the case of our exploit, however, we still have several legitimate users of the object. So ideally what we want to do is wrap to the value of one, then trigger a legitimate releasing of the object. This would exercise the codepath that decrements the reference counter, then checks its new value against zero. If the new value is zero, then the object will be freed. We now have a classic use-after-free vulnerability which can be exploited to achieve code execution, information leaking, and more [4].
+
+It is not difficult to see that other integer elements in the system also have potential for overflows and could be protected in the same way. PaX's SIZE_OVERFLOW plugin can achieve this in certain common and security-relevant cases [5].
+
+[-- Overview / How it works
+
+Assuming all other paths touching the same refcount leave it unchanged and an attacker starts exploiting a path that forces the reference counter to repeatedly increment, once the counter hits INT_MAX (2^31-1), under PAX_REFCOUNT the next increment will trigger a signed overflow in the CPU and the assembly logic in PaX reacts to it by reverting (x86) or not allowing (ARM/MIPS/POWERPC/SPARC) the operation (so the counter remains at INT_MAX - see Appendix A for a special case on x86) and reports the event.
+
+Through this enhancement, execution of any of the paths (both the leaky and the normal ones) that cause an increment will keep (saturate) the counter at INT_MAX (Appendix A explains special cases) and report an overflow event (which when used together with Grsecurity [6] will invoke the lockout mechanism) and decrements will make the counter INT_MAX-<small integer, at most NR_CPUS>.
+
+This defines that normal paths will simply preserve INT_MAX (or something a bit smaller) while the leaky path will keep it at INT_MAX. The consequence is there is no permanent decrement (or further increment) towards zero (the counter value oscillates at/below INT_MAX at most), thus there is no longer a use-after-free situation, only an unavoidable memory leak (which is better than the alternative of code execution in a successful exploitation).
+
+In considering the refcount underflow problem, rather than the aforementioned overflow problem, it is not solvable with the same approach since the vulnerability occurs on the transition from one to zero, without passing across INT_MIN and INT_MAX. Also, detecting a decrement attempt on a zero refcount can only be done after the object has already been freed and possibly reused (exploited). Detection of such underflows would require some sort of delayed refcount decrement operation (where the delay could be indefinite), and there are no methods known to the author that have been proposed to accomplish that at the moment.
+
+[-- Internals
+
+In this part of the article we will analyze at a higher level the implementation decisions, trying to be as general (architecture-independent) as possible, while in the next part of the article we will dig into the architecture-specific details of the implementation.
+
+The first insight for the automated handling of refcount overflows is that in Linux most such variables have a special type (atomic_t, atomic64_t, atomic_long_t) which come with accessor functions. Were it not for this fact we'd have to manually patch every refcount access which is clearly not a scalable or maintainable solution.
+
+This also means that refcounts of regular integer types are not covered by this feature. In this article we do not cover the changes made by the PaX Project in the kernel to expand the usage of the modified functions (atomic operations) in other parts of the kernel where such usage makes sense (switching certain structure fields to atomic_t such as fs_struct.users, tty_port.count, tty_ldisc_ops.refcount, pipe_inode_info.{readers|writers|files|waiting_writers}, kmem_cache.refcount (SLAB and SLUB allocators), etc).
+
+The second insight of PAX_REFCOUNT is that the large majority of atomic_t usage is for reference counters with a small minority for other purposes (statistics, unique identifiers, etc). This means that we have to restrict the usage of atomic_t types to reference counters and introduce new types (atomic_unchecked_t, atomic64_unchecked_t, atomic_long_unchecked_t) to handle non-reference counter uses where overflow is expected and harmless.
+
+The implementation first locates the reference counter accessor functions in the kernel and changes the arithmetic operations for the equivalents that update the processor flags in the event of an overflow.
+
+This paper will only mention the implementation of the _unchecked versions of the accessor functions, but will not explain where they are replaced in the kernel, except to say that the replacement happens in situations where the kernel uses atomic operations where overflows are expected, as in certain fields related to keeping statistics on system events.
+
+Even though PaX supports in its configuration options the activation of the feature (CONFIG_PAX_REFCOUNT), it patches the arithmetic instructions regardless of the option being enabled. This is due to the negligible performance impact over the overflowing equivalent operations versus the complexity of the patch. The difference is that when the option is not on, the system will not trigger the detection logic itself.
+
+The way the detection logic works is relatively straightforward:
+* In arithmetic operations, with the modified instructions that update flags on signed overflows, it is possible to check for the occurrence of the overflow in the operation
+* The check generates an exception in case of overflow, which is then handled by PaX (the way to define if this is a REFCOUNT protection exception is architecture specific)
+- For that, an instruction that causes a conditional exception is needed (a conditional jump over an instruction that generates an identifiable exception can also be used).
+- In some architectures (please see Appendix A for details), the logic needs to revert the operation. On other architectures it just does not commit it to memory.
+* The handler will terminate the process that triggered the overflow and trigger the user lockout mechanism in grsecurity
+
+
+[--- Implementation
+
+The implementation is elegant and involves both architecture-independent code and obviously some architecture-dependent parts. Here we analyze the architecture-independent part of PaX without considering the expansion of protected reference counter usage in other parts of the kernel (the fs_struct.users, tty_port.count, etc mentioned earlier).
+
+fs/exec.c
+New headers and the function:
+pax_report_refcount_overflow(regs)
+
+pax_report_refcount_overflow() is called by the architecture-specific code to handle the reaction to the overflow by:
+* Logging the refcount overflow event
+* Sending a SIGKILL to the current process
+
+include/asm-generic/atomic-long.h
+Define the type atomic_long_unchecked_t and functions for the unchecked operations:
+static inline long atomic_long_read_unchecked()
+static inline void atomic_long_set_unchecked()
+static inline void atomic_long_inc_unchecked()
+static inline void atomic_long_dec_unchecked()
+static inline void atomic_long_add_unchecked()
+static inline long atomic_long_inc_return_unchecked()
+static inline void pax_refcount_needs_these_functions()
+
+include/linux/types.h
+atomic_unchecked_t and atomic64_unchecked_t types (struct with a volatile int counter)
+
+include/linux/vermagic.h
+Adds REFCOUNT to the module versioning if it's enabled in the compiled kernel
+
+security/Kconfig
+Adds the configuration option to the kernel configuration menu
+
+
+[--- Architecture Specifics
+
+Here are the locations where the protection is implemented for different architectures, including some comments on architecture-specific topics:
+
+
+[---- ARM
+
+[----- Detection Logic
+
+All the functions that are used to operate on reference counters are updated to generate overflows.
+
+The overflow detection logic uses a conditional jump in case the overflow is not detected. If the overflow is not detected, it will jump over a bkpt instruction. That means, if an overflow is detected, the conditional jump is not taken, thus executing a bkpt instruction, which causes an exception. bkpt instructions on arm receive a parameter, that is tested in the exception handler to identify if the exception came from the REFCOUNT logic. The same parameter is not used by any other parts of the Linux kernel.
+
+Here is the definition (arch/arm/include/asm/atomic.h):
+
+   #ifdef CONFIG_THUMB2_KERNEL
+   #define REFCOUNT_TRAP_INSN "bkpt   0xf1"
+   #else
+   #define REFCOUNT_TRAP_INSN "bkpt   0xf103"
+   #endif
+
+
+The __ex_table section is used for recovering the exceptions in the kernel [7]. The following macro is defined and later used in the logic:
+
+   #define _ASM_EXTABLE(from, to)      \
+   "   .pushsection __ex_table,\"a\"\n"\
+   "   .align   3\n"         \
+   "   .long   " #from ", " #to"\n"   \
+   "   .popsection"
+
+
+As for the logic, it is quite simple (here is an example for atomic_add()):
+
+    __asm__ __volatile__("@ atomic_add\n"
+   "1:   ldrex   %1, [%3]\n"
+   "   adds   %0, %1, %4\n"      -> 'adds' updates processor flags 
+   
+   #ifdef CONFIG_PAX_REFCOUNT
+   "   bvc   3f\n"               -> branch if no overflow (V is clear)
+   "2:   " REFCOUNT_TRAP_INSN "\n"   -> this will not execute if no overflow, but will execute if 'adds' had an overflow, thus triggering the logic
+   "3:\n"
+   #endif
+   "   strex   %1, %0, [%3]\n"
+   "   teq   %1, #0\n"
+   "   bne   1b"
+
+   #ifdef CONFIG_PAX_REFCOUNT
+   "\n4:\n"
+   _ASM_EXTABLE(2b, 4b)         -> this defines that the label 2 backwards (2b) might generate an exception and in that case the code 
+                     should continue on label 4 backwards (4b), i.e., on overflow we'll skip the 'commit to memory' phase
+   #endif
+
+
+[----- Functions
+
+arch/arm/include/asm/atomic.h:
+- static inline void atomic_add()
+- static inline void atomic_add_unchecked()
+- static inline int atomic_add_return_unchecked()
+- static inline void atomic_sub_unchecked()
+
+
+[----- Exception handler
+
+arch/arm/mm/fault.c
+do_PrefetchAbort() is the function where the handler logic is implemented, but the v7_pabort is the function called to handle the bkpt and then it calls the do_PrefetchAbort()
+
+The arm logic, when identify the overflow, generates an easily identifiable exception instruction:
+bkpt 0xf103 
+
+Basically the parameter for the bkpt instruction will be embedded in its machine code equivalent, and that is checked in do_PrefetchAbort:
+0xe12f1073
+^^^ ^
+
+
+[---- SPARC
+
+PAX_REFCOUNT support on SPARC was added several years ago with major contributions from twiz, co-author of [4] and subsequent book "A Guide to Kernel Exploitation".
+
+[----- Detection logic
+
+Conditional exceptions do exist in SPARC, thus the implementation is much simpler as one can force the specific trap in case of overflow and handle it accordingly.
+
+In that case the logic looks like this (taken from arch/sparc/include/asm/atomic_64.h):
+
+      asm volatile("addcc %2, %0, %0\n"      -> add and modify icc
+
+      #ifdef CONFIG_PAX_REFCOUNT
+              "tvs %%icc, 6\n"            -> trap on integer condition code generating trap number 6
+      #endif
+
+
+[----- Functions
+
+arch/sparc/include/asm/atomic_64.h:	
+- static inline int atomic_add_unless()
+- static inline long atomic_64_add_unless()
+
+arch/sparc/include/asm/spinlock_64.h:
+- static inline void arch_read_lock()
+- static int inline arch_read_trylock()
+- static inline void arch_read_unlock()
+
+arch/sparc/lib/atomic_64.S:
+- atomic_add()
+- atomic_sub()
+- atomic_add_ret()
+- atomic_sub_ret()
+- atomic64_add()
+- atomic64_sub()
+- atomic64_add_ret()
+- atomic64_sub_ret()
+
+arch/sparc/lib/rwsem_64.S:
+- __down_read 
+- __down_read_trylock
+- __down_write
+- __down_write_trylock
+- __up_read
+- __up_write
+- __downgrade_write
+
+
+[----- Exception handler
+
+arch/sparc/kernel/traps_64.c
+void bad_trap() and void bad_trap_tl1()
+
+This is the exception handler implementation for SPARC, which supports defining a specific number in the generation of the exception, thus making it simpler to implement the handler.
+
+
+[---- x86
+
+[----- Detection logic
+
+x86 uses an overflow exception that nothing else triggers, so the handler can assume that exception was always due to the reference count protection (and even if it was not, this is an abnormal exception in kernel mode).
+
+An example of the logic is here (taken from: arch/x86/include/asm/atomic64_64.h):
+
+   asm volatile(LOCK_PREFIX "addq %1,%0\n"      -> will set the overflow flag in case of an overflow
+
+   #ifdef CONFIG_PAX_REFCOUNT
+           "jno 0f\n"                     -> if no overflow occurred, will jump to label 0:
+           LOCK_PREFIX "subq %1,%0\n"      -> if an overflow occurred, will undo the increment above
+           "int $4\n0:\n"                  -> and generate an int 4 trap that is handled
+           _ASM_EXTABLE(0b, 0b)            -> this says that at label 0 backwards (int instruction) an exception
+                              might occur and the code should continue on label 0 backwards (after the int instr)
+                              the first label isn't before the 'int' instruction because int 4 is a trap, not a fault
+   #endif
+
+
+[----- Functions
+
+arch/x86/include/asm/atomic_32.h: 
+- static inline void atomic_add()
+- static inline void atomic_sub()
+- static inline int atomic_sub_and_test()
+- static inline void atomic_inc()
+- static inline void atomic_dec()
+- static inline int atomic_dec_and_test()
+- static inline int atomic_inc_and_test()
+- static inline int atomic_add_negative() 
+- static inline int atomic_add_return()
+- static inline int atomic_add_unless()
+
+arch/x86/include/asm/atomic_64.h:
+- static inline void atomic_add()
+- static inline void atomic_sub()
+- static inline int atomic_sub_and_test()
+- static inline void atomic_inc()
+- static inline void atomic_dec()
+- static inline int atomic_dec_and_test()
+- static inline int atomic_inc_and_test()
+- static inline int atomic_add_negative() 
+- static inline int atomic_add_return()
+- static inline void atomic64_add()
+- static inline void atomic64_sub()
+- static inline int atomic64_sub_and_test()
+- static inline void atomic64_inc()
+- static inline void atomic64_dec()
+- static inline int atomic64_dec_and_test()
+- static inline int atomic64_inc_and_test()
+- static inline int atomic64_add_negative() 
+- static inline int atomic64_add_return()
+- static inline int atomic_add_unless()
+- static inline int atomic64_add_unless()
+
+arch/x86/include/asm/local.h:
+- static inline void local_inc()
+- static inline void local_dec()
+- static inline void local_add()
+- static inline void local_sub()
+- static inline int local_sub_and_test()
+- static inline int local_dec_and_test()
+- static inline int local_inc_and_test()
+- static inline int local_add_negative()
+- static inline long local_add_return()
+
+arch/x86/include/asm/rwsem.h
+- static inline void __down_read() -> 5 different cases in this function
+- static inline void __downgrade_write()
+- static inline void rwsem_atomic_add()
+- static inline rwsem_count_t rwsem_atomic
+
+arch/x86/include/asm/spinlock.h
+- static inline void __raw_read_lock()
+- static inline void __raw_write_lock()
+- static inline void __raw_read_unlock()
+- static inline void __raw_write_unlock()
+
+arch/x86/lib/rwlock_64.S
+- ENTRY() -> 4 different cases in this function
+
+
+[----- Exception handler
+
+arch/x86/kernel/traps.c
+
+The handler is implemented in the do_trap, where it checks the trap number:
+      if (trapnr == 4)
+         pax_report_refcount_overflow(regs);
+
+
+[---- PowerPC
+
+[----- Detection logic
+
+In the PowerPC implementation, PaX uses the instructions lwarx/stwcx to guarantee the exclusive access in the counters check code. Since the architecture does not provide conditional traps neither an bkpt equivalent instruction that can be easily identified by a handler, a bit of hack was necessary:
+* We defined an illegal instruction (or an illegal value in an instruction - like 
+executing wait with WC=0b10) and patch the illegal instruction handler to catch 
+the exception
+* The usual way for choosing the instruction is to see what Linux generates
+for the BUG macro and try to use something similar (for PowerPC it is in
+arch/powerpc/include/asm/bug.h and it is ' b00b00') - we use an opcode that
+trigger the same exception (c00b00).
+* PowerPC uses anchored exceptions, which means the exceptions go to a
+fixed address in memory, so in arch/powerpc/kernel/head_32.S we have the
+address 0x700 (the handler for the program exception, triggered for invalid
+instructions) -> This handler calls the function that should be patched
+
+The process to choose the invalid instruction (and validate the idea) was:
+* Created a kernel module that 'executes' the opcode b00b00 - similar to:
+#define INSTRUCTION_OPCODE "0x00b00b00"
+__asm__ __volatile__ (".long ", INSTRUCTION_OPCODE);
+
+* Check which exception is triggered (validate the anchored address)
+
+* Check if another instruction, such as c00c00 will generate the same exception (it will, 
+since it is an invalid instruction per the PowerPC ISA definition - page 1213 appendix F. Opcode maps):
+
+0	1	2	3
+illegal/reserved	empty	64 -tdi	B -twi
+
+so, Linux already uses:
+
+00	b0	0b	00
+illegal	non-existent	non-existent	non-existent
+
+* So we use:
+00c00b00
+
+* Other illegal instructions could be used:
+lswx RT,RA,RB where RT=RA also invokes the illegal instruction error handler
+
+An example of the logic is here (taken from: arch/powerpc/include/asm/atomic.h):
+
+1:   lwarx   %0,0,%3      # atomic_add\n"   -> Loads the value in a temporary register (so if we don't
+commit the operation, it will not take effect)
+   #ifdef CONFIG_PAX_REFCOUNT
+   mcrxr   cr0\n"            -> This instruction copies bits 0...3 from XER to CR0 (SO, OV and CA flags) and zeroes them out
+
+   addo.   %0,%2,%0\n"         -> Add setting overflow flags in XER (the additional 'o').   The '.' specifies that CR0 receives the summary overflow from XER
+
+   bf 4*cr0+so, 3f\n"         -> bf is a conditional branch if the bit condition is false.  4*cr0+so means that it is testing the SO bit and that each field is 4 bits wide).  The jump target is named 3 and is forward.
+
++2:.long " "0x00c00b00""\n"         -> this will only happen if the above branch is not taken, thus meaning in case of an overflow.  Since c00b00 is an invalid instruction, the handler will be activated.
+
+   #else                  -> if CONFIG_PAX_REFCOUNT is not on in the kernel configuration
+   add   %0,%2,%0\n"            -> normal add operation is the one used by the Linux Kernel
+   #endif
+3:\n                     -> this is the branch target in case of no overflow
+   PPC405_ERR77(0,%3)         -> Linux uses that to simulate hardware conditions, this has nothing to do with the protection
+   stwcx.   %0,0,%3 \n\         -> We commit the operation
+   ...
+
+   #ifdef CONFIG_PAX_REFCOUNT
+4:\n
+   _ASM_EXTABLE(2b, 4b)      -> This is the exception section update to specify that in the label 2 backwards we have
+the possibility of an exception and to continue after the exception handler the point is the label 4 backwards (thus, not
+committing the instruction)
+   #endif
+
+
+[----- Functions
+
+arch/powerpc/include/asm/atomic.h:
+- static __inline__ void atomic_add(int a, atomic_t *v)
+- static __inline__ int atomic_add_return(int a, atomic_t *v)
+- static __inline__ void atomic_sub(int a, atomic_t *v)
+- static __inline__ int atomic_sub_return(int a, atomic_t *v)
+- atomic_inc, atomic_dec, atomic_inc_return, atomic_dec_return macros
+- static __inline__ void atomic64_add(int a, atomic64_t *v)
+- static __inline__ long atomic64_add_return(long a, atomic64_t *v)
+- static __inline__ void atomic64_sub(long a, atomic64_t *v)
+- static __inline__ long atomic64_sub_return(long a, atomic64_t *v)
+- atomic64_inc, atomic64_dec, atomic64_inc_return, atomic64_dec_return macros
+
+arch/powerpc/include/asm/spinlock.h
+- static inline long __arch_read_trylock(arch_rwlock_t *rw)
+- static inline long arch_read_unlock(arch_rwlock_t *rw)
+
+arch/powerpc/include/asm/local.h
+- static __inline__ long local_add_return(long a, local_t *l)
+
+
+[----- Exception handler
+
+arch/powerpc/kernel/traps.c 
+
+The handler that checks the faulty opcode to identify if it is our illegal instruction, and in that case, will trigger the logic in PaX to kill the process.
+
+
+[---- MIPS
+
+PaX recently added PAX_REFCOUNT support for MIPS, based on code contributed by Corey Minyard.
+
+[----- Detection logic
+
+The logic on MIPS is trivial, since the usual instructions generate exceptions on overflow naturally. Thus in that case, PaX just needs to replace the ones that do not generate exceptions for the ones that do:
+
+   #ifdef CONFIG_PAX_REFCOUNT
+      /* Exception on overflow. */
+      "2:   add   %0, %2               \n"            -> On MIPS, add generates exception on overflows
+   #else
+      "   addu   %0, %2            \n"            -> Originally, Linux does not use an instruction that generate overflows
+   #endif
+      "   sc   %0, %1               \n"
+      "   beqzl   %0, 1b            \n"
+   #ifdef CONFIG_PAX_REFCOUNT
+      "3:                        \n"
+      _ASM_EXTABLE(2b, 3b)                     -> Same idea explained in [5].  2b defines the instruction that might generate
+                                             exceptions and 3b explains where the system should resume after the handler
+   #endif
+
+
+[----- Functions
+
+arch/mips/include/asm/atomic.h:
+- static __inline__ void atomic_add(int i, atomic_t *v)
+- static __inline__ void atomic_sub(int i, atomic_t *v)
+- static __inline__ void atomic_add_return(int i, atomic_t *v)
+- static __inline__ void atomic_sub_return(int i, atomic_t *v)
+- static __inline__ void atomic64_add(long i, atomic64_t *v)
+- static __inline__ void atomic64_sub(long i, atomic64_t *v)
+- static __inline__ void atomic64_add_return(long i, atomic64_t *v)
+- static __inline__ void atomic64_sub_return(long i, atomic64_t *v)
+
+arch/mips/include/asm/local.h
+
+
+[----- Exception handler
+
+arch/mips/kernel/traps.c
+
+MIPS provides special instructions that generate a trap on overflow (for example, the instruction 'add' will trap if there is an overflow). If you don't want traps on overflows, you need to use the equivalents that do not trap (e.g., addu).
+
+That said, on MIPS the exception handler uses the fixup_exception() function to differentiate the REFCOUNT overflow:
+   if (fixup_exception(regs)) {
+
+
+The fixup_exception() function uses the _ASM_EXTABLE exception lookup available in the Linux kernel. A good write up on the subject can be seen in the Kernel Documentation [7], but for our purposes it is enough to know that _ASM_EXTABLE defines the address of the potential exception and the address of the handler.
+
+
+[-- APPENDIX A - Special case on x86
+
+x86 presents a special case for the implementation due to a race possibility. For example, due to SPARC's RISC architecture, there is no support for complex atomic operations on memory operands (it uses LL/SC mechanism instead - please refer to Appendix C). In x86, on the other hand, due to that capability, the result of an overflowed refcount can become visible to other CPUs, even if for a brief period of time (cycles, perhaps a few dozen for dirty cache-line transfers).
+
+The risk here is that an attacker could in theory time two or more threads to execute the leaky path in parallel and by hitting the race window, allow one of them to increment past INT_MAX (so that further increments would not trigger the signed overflow detection logic and hence allow a full wraparound to zero and the use-after-free situation). 
+
+To fix that problem (risk), instead of using the original amount to revert the overflowing operation, one can use a multiple of it (NR_CPUS as a multiplier at least). Another approach would be to detect a negative result instead of a signed overflow but this would then need further analysis and special case handling for refcounts that can have negative values legitimately (e.g., page._mapcount). PaX considered this to be such an impractical case that it never implemented this additional logic.
+
+
+[-- APPENDIX B - Assumptions
+
+The whole point of using atomic operations in the implementation is to avoid explicit locking. There is no need to be atomic (Appendix A), but still there is a need to minimize a race window.
+
+It is assumed more than what C99 standard guarantees (Linux is not C99, it is compiled with -std=gnu90), in particular:
+* size of all char types = 8 bits
+* size of all int types = 32 bits
+* size of all long types = size of all pointer types = 32/64 bits
+* signed overflow is assumed to be treated by 2's complement arithmetic
+(e.g., INT_MAX+1=INT_MIN, 2*INT_MAX+1 = UINT_MAX)
+
+[-- APPENDIX C - LL/SC mechanism
+
+LL/SC stands for:
+LL -> Load-Link
+SC -> Store-Conditional
+
+It provides an interface to lock and load. PowerPC provides a very powerful LL/SC because it permits loads and stores in other cache lines inside a pair of LL/SC (lwarx/stwcx).
+
+
+[-- ACKNOWLEDGEMENTS / CREDITS
+
+This paper and the implementation are strongly based on the conversations with PaX Team. The whole idea and explanations of how the protection mechanism works are an interpretation of his explanations. 
+
+
+[-- UPDATE (copied from the blog comments)
+
+by PaX Team » Wed Nov 09, 2016 5:52 pm
+
+A brief update regarding the race condition on x86: during the forward port to the 4.8 kernel we decided to reduce the memory footprint and performance impact of the REFCOUNT instrumentation on the x86 architecture which in turn made it a lot easier to eliminate the exploitation of the race altogether.
+
+
+
+[-- REFERENCES
+
+[1] PaX Team. "PaX: The untold history". H2HC (Hackers to Hackers Conference) 2012. Location: https://pax.grsecurity.net/docs/PaXTeam-H2HC12-PaX-kernel-self-protection.pdf
+[2] Tanenbaum, M. "Modern Operating Systems". 2nd Edition.
+[3] CVE-2011-2013. "Reference Counter Overflow Vulnerability - MS11-083". Location: https://web.nvd.nist.gov/view/vuln/detail?vulnId=CVE-2011-2013
+[4] sgrakkyu and twiz. "Attacking the Core: Kernel exploitation notes". Location: http://phrack.org/issues/64/6.html
+[5] Revfy, E. "Inside the Size Overflow Plugin." Location: http://forums.grsecurity.net/viewtopic.php?f=7&t=3043
+[6] grsecurity. Site: https://grsecurity.net/.
+[7] Kernel Documentation. Location: https://www.kernel.org/doc/Documentation/x86/exception-tables.txt
